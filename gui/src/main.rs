@@ -1,7 +1,3 @@
-// Onur Kose
-// CSC360-02
-// Project 2
-
 use iced::{
     alignment, time,
     widget::{button, column, container, image, row, text, text_input, toggler, Stack},

@@ -1,7 +1,3 @@
-// Onur Kose
-// CSC360-02
-// Project 2
-
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::thread;
@@ -68,7 +64,7 @@ fn start_tcp_listener() {
 }
 
 fn handle_tcp_client(mut stream: TcpStream) {
-    // CRITICAL: Disable Nagle's algorithm to send data immediately
+    // Disable Nagle's algorithm to send data immediately
     if let Err(e) = stream.set_nodelay(true) {
         eprintln!("[TCP] Failed to set nodelay: {}", e);
         return;
