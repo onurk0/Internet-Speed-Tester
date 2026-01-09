@@ -1,0 +1,11 @@
+[package]
+name = "proj2-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+iced = { version = "0.13", features = ["tokio", "image"] }
+image = "0.25.8"
+rand = "0.8"
+
