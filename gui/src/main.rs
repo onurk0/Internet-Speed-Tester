@@ -1,9 +1,16 @@
+//! Speed test GUI client.
+//!
+//! An `iced` desktop app that connects to the speed test server over TCP or
+//! UDP, runs a download test followed by an upload test, and shows live
+//! throughput in Mbps. The network work runs on a background thread that
+//! reports progress back to the UI over an `mpsc` channel.
+
 use iced::{
     alignment, time,
     widget::{button, column, container, image, row, text, text_input, toggler, Stack},
     Background, Border, Color, Element, Length, Size, Subscription, Task, Theme,
 };
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::sync::mpsc;
 use std::thread;
@@ -18,14 +25,24 @@ pub fn main() -> iced::Result {
     .window_size(Size::new(800.0, 600.0))
     .theme(|_| Theme::Dark)
     .subscription(NetworkConfigApp::subscription)
-    .run_with(|| NetworkConfigApp::new())
+    .run_with(NetworkConfigApp::new)
 }
 
 // --- Protocol Constants ---
+// Must match the values used by the server.
 const CMD_DOWNLOAD: u8 = 0x01;
 const CMD_UPLOAD: u8 = 0x02;
 const CMD_ACK: u8 = 0x03;
 const CMD_DONE: u8 = 0x04;
+
+// --- Default Ports ---
+const DEFAULT_TCP_PORT: &str = "8080";
+const DEFAULT_UDP_PORT: &str = "7070";
+
+/// How often live speed updates are sent to the UI during a test.
+const REPORT_INTERVAL: Duration = Duration::from_millis(500);
+/// How long the client sends data during an upload test.
+const UPLOAD_DURATION: Duration = Duration::from_secs(5);
 
 // --- MESSAGES ---
 #[derive(Debug, Clone)]
@@ -33,32 +50,23 @@ pub enum Message {
     IpAddressChanged(String),
     PortChanged(String),
     ProtocolToggled(bool),
+    /// "Connect" button pressed: start a test run.
     Connect,
-    TestStarted,
-    TestUpdate(TestProgress),
-    TestFinished,
+    /// Periodic tick while a test is running; drains the worker's progress channel.
+    Poll,
 }
 
+/// A progress report sent from the worker thread to the UI.
 #[derive(Debug, Clone)]
-pub struct TestProgress {
-    pub phase: String,
-    pub mbps: f64,
-    pub is_download: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Protocol {
-    UDP,
-    TCP,
-}
-
-impl std::fmt::Display for Protocol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Protocol::UDP => write!(f, "UDP"),
-            Protocol::TCP => write!(f, "TCP"),
-        }
-    }
+pub enum TestProgress {
+    /// A status update, optionally with a new speed reading.
+    Update {
+        phase: String,
+        mbps: f64,
+        is_download: bool,
+    },
+    /// The run is over (successfully or not); `phase` is the final status text.
+    Finished { phase: String },
 }
 
 // --- APP STATE ---
@@ -72,17 +80,19 @@ pub struct NetworkConfigApp {
     current_phase: String,
     download_speed: f64,
     upload_speed: f64,
+    /// Receives progress from the worker thread while a test is running.
     receiver: Option<mpsc::Receiver<TestProgress>>,
 }
 
 impl NetworkConfigApp {
     fn new() -> (Self, Task<Message>) {
+        // Path is relative to the working directory, so run from `gui/`.
         let background_image = image::Handle::from_path("TCNJ_Speed.jpg");
 
         (
             Self {
                 ip_address: String::from("127.0.0.1"),
-                port: String::from("8080"),
+                port: String::from(DEFAULT_TCP_PORT),
                 is_tcp: true,
                 background_image,
                 is_testing: false,
@@ -100,15 +110,17 @@ impl NetworkConfigApp {
             Message::IpAddressChanged(val) => self.ip_address = val,
             Message::PortChanged(val) => self.port = val,
             Message::ProtocolToggled(tcp) => {
+                // Switch to the server's port for the chosen protocol.
                 self.is_tcp = tcp;
-                self.port = if tcp { "8080".into() } else { "7070".into() };
+                let port = if tcp { DEFAULT_TCP_PORT } else { DEFAULT_UDP_PORT };
+                self.port = port.into();
             }
             Message::Connect => {
+                // Ignore clicks while a test is already running.
                 if self.is_testing {
                     return Task::none();
                 }
 
-                println!("\n=== STARTING SPEED TEST ===");
                 self.is_testing = true;
                 self.download_speed = 0.0;
                 self.upload_speed = 0.0;
@@ -117,45 +129,61 @@ impl NetworkConfigApp {
                 let (tx, rx) = mpsc::channel();
                 self.receiver = Some(rx);
 
-                let ip = self.ip_address.clone();
-                let port = self.port.clone();
+                let addr = format!("{}:{}", self.ip_address, self.port);
                 let tcp = self.is_tcp;
 
-                thread::spawn(move || run_speed_test(ip, port, tcp, tx));
-
-                return Task::none();
-            }
-            Message::TestStarted => {
-                if let Some(rx) = &self.receiver {
-                    while let Ok(msg) = rx.try_recv() {
-                        if msg.mbps < 0.0 {
-                            return Task::perform(async {}, |_| Message::TestFinished);
-                        }
-                        return Task::perform(async { msg }, Message::TestUpdate);
+                // Run the blocking network test off the UI thread.
+                thread::spawn(move || {
+                    if tcp {
+                        run_tcp_test(&addr, &tx);
+                    } else {
+                        run_udp_test(&addr, &tx);
                     }
-                }
+                });
             }
-            Message::TestUpdate(progress) => {
-                self.current_phase = progress.phase;
-                if progress.is_download {
-                    self.download_speed = progress.mbps;
-                } else {
-                    self.upload_speed = progress.mbps;
-                }
-            }
-            Message::TestFinished => {
-                self.is_testing = false;
-                self.receiver = None;
-                self.current_phase = "Finished".into();
-                println!("=== SPEED TEST COMPLETE ===\n");
-            }
+            Message::Poll => self.drain_progress(),
         }
         Task::none()
     }
 
+    /// Applies every progress report the worker has sent since the last poll.
+    fn drain_progress(&mut self) {
+        let Some(rx) = &self.receiver else {
+            return;
+        };
+
+        let mut finished = false;
+        for progress in rx.try_iter() {
+            match progress {
+                TestProgress::Update {
+                    phase,
+                    mbps,
+                    is_download,
+                } => {
+                    self.current_phase = phase;
+                    if is_download {
+                        self.download_speed = mbps;
+                    } else {
+                        self.upload_speed = mbps;
+                    }
+                }
+                TestProgress::Finished { phase } => {
+                    self.current_phase = phase;
+                    finished = true;
+                }
+            }
+        }
+
+        if finished {
+            self.is_testing = false;
+            self.receiver = None;
+        }
+    }
+
     fn subscription(&self) -> Subscription<Message> {
+        // Only poll the worker channel while a test is in progress.
         if self.is_testing {
-            time::every(Duration::from_millis(100)).map(|_| Message::TestStarted)
+            time::every(Duration::from_millis(100)).map(|_| Message::Poll)
         } else {
             Subscription::none()
         }
@@ -169,6 +197,7 @@ impl NetworkConfigApp {
         let content = container(
             column![
                 text("Speed Testing").size(32).color(Color::WHITE),
+                // Live status and results panel
                 container(
                     column![
                         text(format!("Status: {}", self.current_phase))
@@ -197,7 +226,9 @@ impl NetworkConfigApp {
                     },
                     ..Default::default()
                 }),
+                // Spacer
                 text("").size(20),
+                // Connection settings
                 column![
                     text("IP Address:").size(16).color(Color::WHITE),
                     text_input("Enter IP", &self.ip_address)
@@ -244,6 +275,7 @@ impl NetworkConfigApp {
             ..Default::default()
         });
 
+        // Layer the centered panel on top of the full-window background image.
         container(
             Stack::new().push(background).push(
                 container(content)
@@ -263,556 +295,246 @@ impl NetworkConfigApp {
 //           NETWORK LOGIC (WORKER)
 // ==========================================
 
-fn run_speed_test(ip: String, port: String, is_tcp: bool, tx: mpsc::Sender<TestProgress>) {
-    let addr = format!("{}:{}", ip, port);
-    println!("Target: {} ({})", addr, if is_tcp { "TCP" } else { "UDP" });
+/// Sends a status/speed update to the UI.
+fn report(tx: &mpsc::Sender<TestProgress>, phase: &str, mbps: f64, is_download: bool) {
+    let _ = tx.send(TestProgress::Update {
+        phase: phase.into(),
+        mbps,
+        is_download,
+    });
+}
 
-    if is_tcp {
-        run_tcp_test(&addr, tx);
+/// Ends the test run and shows `phase` as the final status.
+fn finish(tx: &mpsc::Sender<TestProgress>, phase: impl Into<String>) {
+    let _ = tx.send(TestProgress::Finished {
+        phase: phase.into(),
+    });
+}
+
+/// Converts a byte count over a duration (in seconds) to megabits per second.
+fn to_mbps(bytes: usize, secs: f64) -> f64 {
+    if secs > 0.0 {
+        (bytes as f64 * 8.0) / (secs * 1_000_000.0)
     } else {
-        run_udp_test(&addr, tx);
+        0.0
     }
 }
 
-fn run_tcp_test(addr: &str, tx: mpsc::Sender<TestProgress>) {
-    println!("[CLIENT-TCP] Connecting to {}...", addr);
+/// Tracks bytes transferred and sends a live speed update every `REPORT_INTERVAL`.
+struct SpeedMeter {
+    start: Instant,
+    last_report: Instant,
+    bytes_interval: usize,
+    total_bytes: usize,
+}
 
-    let mut stream = match TcpStream::connect(addr) {
-        Ok(s) => {
-            println!("[CLIENT-TCP] Connected successfully!");
-            s
+impl SpeedMeter {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            start: now,
+            last_report: now,
+            bytes_interval: 0,
+            total_bytes: 0,
         }
-        Err(e) => {
-            println!("[CLIENT-TCP] ERROR: Connection failed: {}", e);
-            let _ = tx.send(TestProgress {
-                phase: format!("Connection Failed: {}", e),
-                mbps: -1.0,
-                is_download: true,
-            });
-            return;
-        }
-    };
-
-    // CRITICAL: Disable Nagle's algorithm and set generous timeouts
-    if let Err(e) = stream.set_nodelay(true) {
-        println!("[CLIENT-TCP] ERROR: Failed to set nodelay: {}", e);
-    } else {
-        println!("[CLIENT-TCP] Set TCP_NODELAY = true");
     }
 
-    // Use longer timeouts to prevent premature connection closure
+    /// Records `n` transferred bytes, reporting the interval speed if it's time.
+    fn add(&mut self, n: usize, tx: &mpsc::Sender<TestProgress>, phase: &str, is_download: bool) {
+        self.bytes_interval += n;
+        self.total_bytes += n;
+
+        if self.last_report.elapsed() >= REPORT_INTERVAL {
+            let mbps = to_mbps(self.bytes_interval, self.last_report.elapsed().as_secs_f64());
+            report(tx, phase, mbps, is_download);
+            self.bytes_interval = 0;
+            self.last_report = Instant::now();
+        }
+    }
+
+    /// Average speed over the whole test so far.
+    fn average_mbps(&self) -> f64 {
+        to_mbps(self.total_bytes, self.start.elapsed().as_secs_f64())
+    }
+}
+
+/// Sends a one-byte command and waits for the server's ACK.
+fn tcp_handshake(stream: &mut TcpStream, cmd: u8) -> Result<(), String> {
+    stream
+        .write_all(&[cmd])
+        .and_then(|_| stream.flush())
+        .map_err(|e| format!("Failed to send command: {}", e))?;
+
+    // Give the server a moment to process the command.
+    thread::sleep(Duration::from_millis(50));
+
+    let mut ack = [0u8; 1];
+    match stream.read_exact(&mut ack) {
+        Ok(_) if ack[0] == CMD_ACK => Ok(()),
+        Ok(_) => Err(format!("Wrong response: 0x{:02x}", ack[0])),
+        Err(e) => Err(format!("No ACK: {}", e)),
+    }
+}
+
+/// Runs the TCP download test followed by the upload test against `addr`.
+fn run_tcp_test(addr: &str, tx: &mpsc::Sender<TestProgress>) {
+    let mut stream = match TcpStream::connect(addr) {
+        Ok(s) => s,
+        Err(e) => return finish(tx, format!("Connection Failed: {}", e)),
+    };
+
+    // Disable Nagle's algorithm so single-byte commands are sent immediately.
+    let _ = stream.set_nodelay(true);
+
+    // Generous timeouts so slow links aren't dropped mid-test.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
     // === DOWNLOAD TEST ===
-    println!("\n[CLIENT-TCP] === STARTING DOWNLOAD TEST ===");
-    let _ = tx.send(TestProgress {
-        phase: "Downloading (TCP)...".into(),
-        mbps: 0.0,
-        is_download: true,
-    });
+    report(tx, "Downloading (TCP)...", 0.0, true);
 
-    println!(
-        "[CLIENT-TCP-DL] Step 1: Sending DOWNLOAD command (0x{:02x})",
-        CMD_DOWNLOAD
-    );
-    if let Err(e) = stream.write_all(&[CMD_DOWNLOAD]) {
-        println!("[CLIENT-TCP-DL] ERROR: Failed to send command: {}", e);
-        let _ = tx.send(TestProgress {
-            phase: "Failed to send download command".into(),
-            mbps: -1.0,
-            is_download: true,
-        });
-        return;
-    }
-    if let Err(e) = stream.flush() {
-        println!("[CLIENT-TCP-DL] ERROR: Failed to flush: {}", e);
-        return;
+    if let Err(e) = tcp_handshake(&mut stream, CMD_DOWNLOAD) {
+        return finish(tx, e);
     }
 
-    // Small delay to let server process the command
-    thread::sleep(Duration::from_millis(50));
-
-    println!("[CLIENT-TCP-DL] Step 2: Waiting for ACK...");
-    let mut ack = [0u8; 1];
-    match stream.read_exact(&mut ack) {
-        Ok(_) if ack[0] == CMD_ACK => {
-            println!("[CLIENT-TCP-DL] Step 3: Received ACK (0x{:02x})", ack[0]);
-        }
-        Ok(_) => {
-            println!(
-                "[CLIENT-TCP-DL] ERROR: Expected ACK but got 0x{:02x}",
-                ack[0]
-            );
-            let _ = tx.send(TestProgress {
-                phase: format!("Wrong response: 0x{:02x}", ack[0]),
-                mbps: -1.0,
-                is_download: true,
-            });
-            return;
-        }
-        Err(e) => {
-            println!("[CLIENT-TCP-DL] ERROR: Failed to receive ACK: {}", e);
-            let _ = tx.send(TestProgress {
-                phase: format!("No ACK: {}", e),
-                mbps: -1.0,
-                is_download: true,
-            });
-            return;
-        }
-    }
-
-    println!("[CLIENT-TCP-DL] Step 4: Starting to receive data...");
-
-    // Use a larger buffer and non-blocking reads with timeout handling
     let mut buf = vec![0u8; 8192];
-    let start = Instant::now();
-    let mut last_report = start;
-    let mut bytes_interval = 0;
-    let mut total_bytes = 0;
+    let mut meter = SpeedMeter::new();
 
-    loop {
-        if start.elapsed() > Duration::from_secs(8) {
-            println!("[CLIENT-TCP-DL] WARNING: Test duration exceeded");
-            break;
-        }
-
+    // Read until the server sends DONE, closes, or we pass a safety timeout.
+    while meter.start.elapsed() <= Duration::from_secs(8) {
         match stream.read(&mut buf) {
-            Ok(0) => {
-                println!("[CLIENT-TCP-DL] Connection closed by server");
-                break;
-            }
+            Ok(0) => break,
             Ok(n) => {
-                // Check if this is just the DONE signal
-                if n == 1 && buf[0] == CMD_DONE {
-                    println!(
-                        "[CLIENT-TCP-DL] Step 5: Received DONE signal (0x{:02x})",
-                        buf[0]
-                    );
+                // Data bytes are never CMD_DONE, so DONE is always the last byte
+                // of the final read, even if it arrived together with data.
+                if buf[n - 1] == CMD_DONE {
+                    meter.add(n - 1, tx, "Downloading...", true);
                     break;
                 }
-
-                bytes_interval += n;
-                total_bytes += n;
-
-                // Report speed every 500ms
-                if last_report.elapsed() >= Duration::from_millis(500) {
-                    let mbps = (bytes_interval as f64 * 8.0)
-                        / (last_report.elapsed().as_secs_f64() * 1_000_000.0);
-                    println!(
-                        "[CLIENT-TCP-DL] Interval speed: {:.2} Mbps ({} bytes)",
-                        mbps, total_bytes
-                    );
-                    let _ = tx.send(TestProgress {
-                        phase: "Downloading...".into(),
-                        mbps,
-                        is_download: true,
-                    });
-                    bytes_interval = 0;
-                    last_report = Instant::now();
-                }
+                meter.add(n, tx, "Downloading...", true);
             }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                // This shouldn't happen with blocking reads, but handle it
-                continue;
-            }
-            Err(e) => {
-                println!("[CLIENT-TCP-DL] ERROR: Read error: {}", e);
-                break;
-            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+            Err(_) => break,
         }
     }
 
-    let elapsed = start.elapsed().as_secs_f64();
-    let total_mbps = if elapsed > 0.0 {
-        (total_bytes as f64 * 8.0) / (elapsed * 1_000_000.0)
-    } else {
-        0.0
-    };
+    report(tx, "Download Complete", meter.average_mbps(), true);
 
-    println!("[CLIENT-TCP-DL] Step 6: Download complete");
-    println!(
-        "[CLIENT-TCP-DL]   - Total: {} bytes ({:.2} MB)",
-        total_bytes,
-        total_bytes as f64 / 1_000_000.0
-    );
-    println!("[CLIENT-TCP-DL]   - Duration: {:.2} seconds", elapsed);
-    println!("[CLIENT-TCP-DL]   - Average: {:.2} Mbps", total_mbps);
-
-    let _ = tx.send(TestProgress {
-        phase: "Download Complete".into(),
-        mbps: total_mbps,
-        is_download: true,
-    });
-
-    // Small delay between tests
+    // Small delay between tests.
     thread::sleep(Duration::from_millis(100));
 
     // === UPLOAD TEST ===
-    println!("\n[CLIENT-TCP] === STARTING UPLOAD TEST ===");
-    let _ = tx.send(TestProgress {
-        phase: "Uploading (TCP)...".into(),
-        mbps: 0.0,
-        is_download: false,
-    });
+    report(tx, "Uploading (TCP)...", 0.0, false);
 
-    println!(
-        "[CLIENT-TCP-UL] Step 1: Sending UPLOAD command (0x{:02x})",
-        CMD_UPLOAD
-    );
-    if let Err(e) = stream.write_all(&[CMD_UPLOAD]) {
-        println!("[CLIENT-TCP-UL] ERROR: Failed to send command: {}", e);
-        return;
+    if let Err(e) = tcp_handshake(&mut stream, CMD_UPLOAD) {
+        return finish(tx, e);
     }
-    let _ = stream.flush();
-
-    thread::sleep(Duration::from_millis(50));
-
-    println!("[CLIENT-TCP-UL] Step 2: Waiting for ACK...");
-    match stream.read_exact(&mut ack) {
-        Ok(_) if ack[0] == CMD_ACK => {
-            println!("[CLIENT-TCP-UL] Step 3: Received ACK (0x{:02x})", ack[0]);
-        }
-        Ok(_) => {
-            println!(
-                "[CLIENT-TCP-UL] ERROR: Expected ACK but got 0x{:02x}",
-                ack[0]
-            );
-            return;
-        }
-        Err(e) => {
-            println!("[CLIENT-TCP-UL] ERROR: Failed to receive ACK: {}", e);
-            return;
-        }
-    }
-
-    println!("[CLIENT-TCP-UL] Step 4: Starting to send data...");
 
     let payload = vec![1u8; 8192];
-    let start = Instant::now();
-    let mut last_report = start;
-    let mut bytes_interval = 0;
-    let mut total_bytes = 0;
+    let mut meter = SpeedMeter::new();
 
-    while start.elapsed() < Duration::from_secs(5) {
+    while meter.start.elapsed() < UPLOAD_DURATION {
         match stream.write(&payload) {
-            Ok(n) => {
-                bytes_interval += n;
-                total_bytes += n;
-            }
-            Err(e) => {
-                println!("[CLIENT-TCP-UL] ERROR: Write failed: {}", e);
-                break;
-            }
-        }
-
-        if last_report.elapsed() >= Duration::from_millis(500) {
-            let mbps =
-                (bytes_interval as f64 * 8.0) / (last_report.elapsed().as_secs_f64() * 1_000_000.0);
-            println!("[CLIENT-TCP-UL] Interval speed: {:.2} Mbps", mbps);
-            let _ = tx.send(TestProgress {
-                phase: "Uploading...".into(),
-                mbps,
-                is_download: false,
-            });
-            bytes_interval = 0;
-            last_report = Instant::now();
+            Ok(n) => meter.add(n, tx, "Uploading...", false),
+            Err(_) => break,
         }
     }
 
     let _ = stream.flush();
 
-    println!("[CLIENT-TCP-UL] Step 5: Waiting for DONE signal...");
-    match stream.read_exact(&mut ack) {
-        Ok(_) if ack[0] == CMD_DONE => {
-            println!(
-                "[CLIENT-TCP-UL] Step 6: Received DONE signal (0x{:02x})",
-                ack[0]
-            );
-        }
-        Ok(_) => {
-            println!(
-                "[CLIENT-TCP-UL] WARNING: Expected DONE but got 0x{:02x}",
-                ack[0]
-            );
-        }
-        Err(e) => {
-            println!("[CLIENT-TCP-UL] WARNING: Failed to receive DONE: {}", e);
-        }
-    }
+    // Wait for the server's DONE so the timing covers data it actually received.
+    // A missing or unexpected reply isn't fatal; we still report the result.
+    let mut done = [0u8; 1];
+    let _ = stream.read_exact(&mut done);
 
-    let elapsed = start.elapsed().as_secs_f64();
-    let total_mbps = if elapsed > 0.0 {
-        (total_bytes as f64 * 8.0) / (elapsed * 1_000_000.0)
-    } else {
-        0.0
-    };
-
-    println!("[CLIENT-TCP-UL] Step 7: Upload complete");
-    println!(
-        "[CLIENT-TCP-UL]   - Total: {} bytes ({:.2} MB)",
-        total_bytes,
-        total_bytes as f64 / 1_000_000.0
-    );
-    println!("[CLIENT-TCP-UL]   - Average: {:.2} Mbps", total_mbps);
-
-    let _ = tx.send(TestProgress {
-        phase: "Upload Complete".into(),
-        mbps: total_mbps,
-        is_download: false,
-    });
-
-    println!("[CLIENT-TCP] === ALL TESTS COMPLETE ===");
-
-    // Signal finish
-    let _ = tx.send(TestProgress {
-        phase: "Done".into(),
-        mbps: -1.0,
-        is_download: true,
-    });
+    report(tx, "Upload Complete", meter.average_mbps(), false);
+    finish(tx, "Finished");
 }
 
-fn run_udp_test(addr: &str, tx: mpsc::Sender<TestProgress>) {
-    println!("[CLIENT-UDP] Binding socket...");
-
+/// Runs the UDP download test followed by the upload test against `addr`.
+fn run_udp_test(addr: &str, tx: &mpsc::Sender<TestProgress>) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
-        Ok(s) => {
-            println!("[CLIENT-UDP] Socket bound successfully");
-            s
-        }
-        Err(e) => {
-            println!("[CLIENT-UDP] ERROR: Bind failed: {}", e);
-            let _ = tx.send(TestProgress {
-                phase: format!("UDP Bind Failed: {}", e),
-                mbps: -1.0,
-                is_download: true,
-            });
-            return;
-        }
+        Ok(s) => s,
+        Err(e) => return finish(tx, format!("UDP Bind Failed: {}", e)),
     };
 
-    // Longer timeout for UDP
+    // Allow time for the server's ACK to arrive.
     let _ = socket.set_read_timeout(Some(Duration::from_millis(2000)));
 
-    if socket.connect(addr).is_err() {
-        println!("[CLIENT-UDP] ERROR: Connect failed");
-        return;
+    // "Connect" the UDP socket so send/recv default to the server address.
+    if let Err(e) = socket.connect(addr) {
+        return finish(tx, format!("UDP Connect Failed: {}", e));
     }
-    println!("[CLIENT-UDP] Connected to {}", addr);
 
     // === DOWNLOAD TEST ===
-    println!("\n[CLIENT-UDP] === STARTING DOWNLOAD TEST ===");
-    let _ = tx.send(TestProgress {
-        phase: "Downloading (UDP)...".into(),
-        mbps: 0.0,
-        is_download: true,
-    });
+    report(tx, "Downloading (UDP)...", 0.0, true);
 
-    println!(
-        "[CLIENT-UDP-DL] Step 1: Sending DOWNLOAD trigger (0x{:02x})",
-        CMD_DOWNLOAD
-    );
     if socket.send(&[CMD_DOWNLOAD]).is_err() {
-        println!("[CLIENT-UDP-DL] ERROR: Failed to send trigger");
-        return;
+        return finish(tx, "Failed to send download command");
     }
 
-    println!("[CLIENT-UDP-DL] Step 2: Waiting for ACK...");
     let mut buf = vec![0u8; 2048];
 
     match socket.recv(&mut buf) {
-        Ok(n) if n > 0 && buf[0] == CMD_ACK => {
-            println!("[CLIENT-UDP-DL] Step 3: Received ACK (0x{:02x})", buf[0]);
-        }
-        Ok(n) => {
-            println!(
-                "[CLIENT-UDP-DL] ERROR: Expected ACK but got {} bytes, first byte: 0x{:02x}",
-                n, buf[0]
-            );
-            let _ = tx.send(TestProgress {
-                phase: "No ACK for UDP download".into(),
-                mbps: -1.0,
-                is_download: true,
-            });
-            return;
-        }
-        Err(e) => {
-            println!("[CLIENT-UDP-DL] ERROR: Failed to receive ACK: {}", e);
-            let _ = tx.send(TestProgress {
-                phase: "No ACK for UDP download".into(),
-                mbps: -1.0,
-                is_download: true,
-            });
-            return;
-        }
+        Ok(n) if n > 0 && buf[0] == CMD_ACK => {}
+        _ => return finish(tx, "No ACK for UDP download"),
     }
 
-    println!("[CLIENT-UDP-DL] Step 4: Starting to receive packets...");
-
-    // Shorter timeout for receiving packets
+    // Shorter timeout while receiving so we can notice when packets stop.
     let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
 
-    let start = Instant::now();
-    let mut last_report = start;
-    let mut bytes_interval = 0;
-    let mut total_bytes = 0;
-    let mut packets = 0;
+    let mut meter = SpeedMeter::new();
     let mut consecutive_timeouts = 0;
 
-    while start.elapsed() < Duration::from_secs(7) {
+    while meter.start.elapsed() < Duration::from_secs(7) {
         match socket.recv(&mut buf) {
             Ok(n) => {
                 consecutive_timeouts = 0;
 
-                // Check for DONE signal
+                // DONE arrives as its own single-byte datagram.
                 if n == 1 && buf[0] == CMD_DONE {
-                    println!(
-                        "[CLIENT-UDP-DL] Step 5: Received DONE signal (0x{:02x})",
-                        buf[0]
-                    );
                     break;
                 }
 
-                bytes_interval += n;
-                total_bytes += n;
-                packets += 1;
-
-                if last_report.elapsed() >= Duration::from_millis(500) {
-                    let mbps = (bytes_interval as f64 * 8.0)
-                        / (last_report.elapsed().as_secs_f64() * 1_000_000.0);
-                    println!(
-                        "[CLIENT-UDP-DL] Speed: {:.2} Mbps ({} packets, {} bytes total)",
-                        mbps, packets, total_bytes
-                    );
-                    let _ = tx.send(TestProgress {
-                        phase: "Downloading...".into(),
-                        mbps,
-                        is_download: true,
-                    });
-                    bytes_interval = 0;
-                    last_report = Instant::now();
-                }
+                meter.add(n, tx, "Downloading...", true);
             }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 consecutive_timeouts += 1;
-                // If we haven't received anything for a while, the test might be over
-                if consecutive_timeouts > 20 && start.elapsed() > Duration::from_secs(5) {
-                    println!("[CLIENT-UDP-DL] No more packets received, ending test");
+                // UDP is lossy, so DONE may never arrive. If nothing has come in for
+                // a while after the expected test window, assume the test is over.
+                if consecutive_timeouts > 20 && meter.start.elapsed() > Duration::from_secs(5) {
                     break;
                 }
-                continue;
             }
-            Err(e) => {
-                println!("[CLIENT-UDP-DL] ERROR: Receive error: {}", e);
-                break;
-            }
+            Err(_) => break,
         }
     }
 
-    let elapsed = start.elapsed().as_secs_f64();
-    let total_mbps = if elapsed > 0.0 {
-        (total_bytes as f64 * 8.0) / (elapsed * 1_000_000.0)
-    } else {
-        0.0
-    };
-
-    println!("[CLIENT-UDP-DL] Step 6: Download complete");
-    println!("[CLIENT-UDP-DL]   - Received {} packets", packets);
-    println!(
-        "[CLIENT-UDP-DL]   - Total: {} bytes ({:.2} MB)",
-        total_bytes,
-        total_bytes as f64 / 1_000_000.0
-    );
-    println!("[CLIENT-UDP-DL]   - Average: {:.2} Mbps", total_mbps);
-
-    let _ = tx.send(TestProgress {
-        phase: "Download Complete".into(),
-        mbps: total_mbps,
-        is_download: true,
-    });
+    report(tx, "Download Complete", meter.average_mbps(), true);
 
     thread::sleep(Duration::from_millis(200));
 
     // === UPLOAD TEST ===
-    println!("\n[CLIENT-UDP] === STARTING UPLOAD TEST ===");
-    let _ = tx.send(TestProgress {
-        phase: "Uploading (UDP)...".into(),
-        mbps: 0.0,
-        is_download: false,
-    });
+    // UDP upload has no handshake: send the trigger, then stream packets.
+    report(tx, "Uploading (UDP)...", 0.0, false);
 
-    println!(
-        "[CLIENT-UDP-UL] Step 1: Sending UPLOAD trigger (0x{:02x})",
-        CMD_UPLOAD
-    );
     let _ = socket.send(&[CMD_UPLOAD]);
 
-    println!("[CLIENT-UDP-UL] Step 2: Starting to send packets...");
-
     let payload = vec![1u8; 1024];
-    let start = Instant::now();
-    let mut last_report = start;
-    let mut bytes_interval = 0;
-    let mut total_bytes = 0;
-    let mut packets = 0;
+    let mut meter = SpeedMeter::new();
 
-    while start.elapsed() < Duration::from_secs(5) {
-        if socket.send(&payload).is_ok() {
-            bytes_interval += payload.len();
-            total_bytes += payload.len();
-            packets += 1;
-        }
+    while meter.start.elapsed() < UPLOAD_DURATION {
+        let sent = if socket.send(&payload).is_ok() {
+            payload.len()
+        } else {
+            0
+        };
+        meter.add(sent, tx, "Uploading...", false);
 
+        // Brief pause so we don't overrun the send buffer.
         thread::sleep(Duration::from_micros(10));
-
-        if last_report.elapsed() >= Duration::from_millis(500) {
-            let mbps =
-                (bytes_interval as f64 * 8.0) / (last_report.elapsed().as_secs_f64() * 1_000_000.0);
-            println!("[CLIENT-UDP-UL] Interval speed: {:.2} Mbps", mbps);
-            let _ = tx.send(TestProgress {
-                phase: "Uploading...".into(),
-                mbps,
-                is_download: false,
-            });
-            bytes_interval = 0;
-            last_report = Instant::now();
-        }
     }
 
-    let elapsed = start.elapsed().as_secs_f64();
-    let total_mbps = if elapsed > 0.0 {
-        (total_bytes as f64 * 8.0) / (elapsed * 1_000_000.0)
-    } else {
-        0.0
-    };
-
-    println!("[CLIENT-UDP-UL] Step 3: Upload complete");
-    println!("[CLIENT-UDP-UL]   - Sent {} packets", packets);
-    println!(
-        "[CLIENT-UDP-UL]   - Total: {} bytes ({:.2} MB)",
-        total_bytes,
-        total_bytes as f64 / 1_000_000.0
-    );
-    println!("[CLIENT-UDP-UL]   - Average: {:.2} Mbps", total_mbps);
-
-    let _ = tx.send(TestProgress {
-        phase: "Upload Complete".into(),
-        mbps: total_mbps,
-        is_download: false,
-    });
-
-    println!("[CLIENT-UDP] === ALL TESTS COMPLETE ===");
-
-    // Signal finish
-    let _ = tx.send(TestProgress {
-        phase: "Done".into(),
-        mbps: -1.0,
-        is_download: true,
-    });
+    report(tx, "Upload Complete", meter.average_mbps(), false);
+    finish(tx, "Finished");
 }

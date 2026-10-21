@@ -1,16 +1,26 @@
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+//! Speed test server.
+//!
+//! Listens on a TCP port and a UDP port and runs throughput tests on request.
+//! A client sends a one-byte command (download or upload); the server replies
+//! with ACK, streams or sinks data for `TEST_DURATION`, and then sends DONE.
+
+use std::io::{ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
 // --- Configuration Constants ---
 const TCP_PORT: u16 = 8080;
 const UDP_PORT: u16 = 7070;
+/// Size of each chunk written to / read from a TCP stream.
 const BUFFER_SIZE: usize = 1024 * 4;
+/// Size of each UDP datagram sent during a download test.
 const UDP_PAYLOAD_SIZE: usize = 1024;
+/// How long each download/upload test runs.
 const TEST_DURATION: Duration = Duration::from_secs(5);
 
 // --- Protocol Constants ---
+// Must match the values used by the GUI client.
 const CMD_DOWNLOAD: u8 = 0x01;
 const CMD_UPLOAD: u8 = 0x02;
 const CMD_ACK: u8 = 0x03;
@@ -20,16 +30,10 @@ fn main() {
     println!("=== Starting Speed Test Server ===");
     println!("TCP Listening on port {}", TCP_PORT);
     println!("UDP Listening on port {}", UDP_PORT);
-    println!("Protocol: DOWNLOAD=0x01, UPLOAD=0x02, ACK=0x03, DONE=0x04");
-    println!();
 
-    let tcp_handle = thread::spawn(|| {
-        start_tcp_listener();
-    });
-
-    let udp_handle = thread::spawn(|| {
-        start_udp_listener();
-    });
+    // Run the TCP and UDP listeners side by side; neither returns in normal operation.
+    let tcp_handle = thread::spawn(start_tcp_listener);
+    let udp_handle = thread::spawn(start_udp_listener);
 
     let _ = tcp_handle.join();
     let _ = udp_handle.join();
@@ -39,225 +43,126 @@ fn main() {
 //              TCP HANDLING
 // ==========================================
 
+/// Accepts TCP connections and handles each client on its own thread.
 fn start_tcp_listener() {
     let listener =
         TcpListener::bind(format!("0.0.0.0:{}", TCP_PORT)).expect("Failed to bind TCP port");
 
-    println!("[TCP] Listener started successfully");
-
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                println!(
-                    "\n[TCP] ===== New Client Connected: {:?} =====",
-                    stream.peer_addr()
-                );
-                thread::spawn(|| {
-                    handle_tcp_client(stream);
-                });
+                thread::spawn(move || handle_tcp_client(stream));
             }
-            Err(e) => {
-                eprintln!("[TCP] Connection failed: {}", e);
-            }
+            Err(e) => eprintln!("[TCP] Connection failed: {}", e),
         }
     }
 }
 
+/// Reads commands from a connected client until it disconnects or a test fails.
 fn handle_tcp_client(mut stream: TcpStream) {
-    // Disable Nagle's algorithm to send data immediately
+    // Disable Nagle's algorithm so the single-byte ACK/DONE signals go out immediately.
     if let Err(e) = stream.set_nodelay(true) {
         eprintln!("[TCP] Failed to set nodelay: {}", e);
         return;
     }
-    println!("[TCP] Set TCP_NODELAY = true");
 
-    // Use longer timeouts to prevent premature disconnection
+    // Generous timeouts so slow links aren't dropped mid-test.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
 
     let mut command_buf = [0u8; 1];
 
-    loop {
-        println!("[TCP] Waiting for command...");
-        match stream.read_exact(&mut command_buf) {
-            Ok(_) => {
-                let cmd = command_buf[0];
-                println!("[TCP] Received command: 0x{:02x}", cmd);
-
-                match cmd {
-                    CMD_DOWNLOAD => {
-                        println!("[TCP] >>> Starting DOWNLOAD Test <<<");
-                        if !handle_tcp_download(&mut stream) {
-                            println!("[TCP] Download test failed, closing connection");
-                            break;
-                        }
-                        println!("[TCP] >>> DOWNLOAD Test Complete <<<");
-                    }
-                    CMD_UPLOAD => {
-                        println!("[TCP] >>> Starting UPLOAD Test <<<");
-                        if !handle_tcp_upload(&mut stream) {
-                            println!("[TCP] Upload test failed, closing connection");
-                            break;
-                        }
-                        println!("[TCP] >>> UPLOAD Test Complete <<<");
-                    }
-                    _ => {
-                        eprintln!("[TCP] ERROR: Unknown command 0x{:02x}", cmd);
-                        break;
-                    }
-                }
+    // Any read error here (including a clean disconnect) ends the session.
+    while stream.read_exact(&mut command_buf).is_ok() {
+        let ok = match command_buf[0] {
+            CMD_DOWNLOAD => handle_tcp_download(&mut stream),
+            CMD_UPLOAD => handle_tcp_upload(&mut stream),
+            cmd => {
+                eprintln!("[TCP] Unknown command 0x{:02x}", cmd);
+                false
             }
-            Err(e) => {
-                println!("[TCP] Client disconnected: {}", e);
-                break;
-            }
+        };
+        if !ok {
+            break;
         }
     }
-    println!("[TCP] ===== Client Session Ended =====\n");
 }
 
+/// Writes a single protocol byte and flushes it.
+fn send_signal(stream: &mut TcpStream, signal: u8) -> std::io::Result<()> {
+    stream.write_all(&[signal])?;
+    stream.flush()
+}
+
+/// Download test: ACK, flood the client with data for `TEST_DURATION`, then DONE.
+/// Returns `false` if the connection should be closed.
 fn handle_tcp_download(stream: &mut TcpStream) -> bool {
-    println!("[TCP-DL] Step 1: Sending ACK (0x{:02x})", CMD_ACK);
-
-    // Send ACK
-    if let Err(e) = stream.write_all(&[CMD_ACK]) {
-        eprintln!("[TCP-DL] ERROR: Failed to write ACK: {}", e);
+    if let Err(e) = send_signal(stream, CMD_ACK) {
+        eprintln!("[TCP-DL] Failed to send ACK: {}", e);
         return false;
     }
-    if let Err(e) = stream.flush() {
-        eprintln!("[TCP-DL] ERROR: Failed to flush ACK: {}", e);
-        return false;
-    }
-    println!("[TCP-DL] Step 2: ACK sent and flushed");
 
-    // Small delay to ensure ACK is received before data flood
+    // Small delay so the ACK arrives on its own, ahead of the data flood.
     thread::sleep(Duration::from_millis(10));
-
-    println!(
-        "[TCP-DL] Step 3: Starting data transmission for {} seconds",
-        TEST_DURATION.as_secs()
-    );
 
     let data = [1u8; BUFFER_SIZE];
     let start_time = Instant::now();
-    let mut bytes_sent = 0u64;
-    let mut packets_sent = 0u64;
 
     while start_time.elapsed() < TEST_DURATION {
-        match stream.write(&data) {
-            Ok(n) => {
-                bytes_sent += n as u64;
-                packets_sent += 1;
-            }
-            Err(e) => {
-                eprintln!(
-                    "[TCP-DL] ERROR: Write error after {} bytes: {}",
-                    bytes_sent, e
-                );
-                return false;
-            }
+        if let Err(e) = stream.write(&data) {
+            eprintln!("[TCP-DL] Write error: {}", e);
+            return false;
         }
     }
 
     if let Err(e) = stream.flush() {
-        eprintln!("[TCP-DL] ERROR: Final flush failed: {}", e);
+        eprintln!("[TCP-DL] Final flush failed: {}", e);
         return false;
     }
 
-    println!("[TCP-DL] Step 4: Data transmission complete");
-    println!("[TCP-DL]   - Sent {} packets", packets_sent);
-    println!(
-        "[TCP-DL]   - Sent {} bytes ({:.2} MB)",
-        bytes_sent,
-        bytes_sent as f64 / 1_000_000.0
-    );
-
-    // Small delay before sending DONE
+    // Small delay so DONE is less likely to be coalesced with the last data chunk.
     thread::sleep(Duration::from_millis(10));
 
-    println!("[TCP-DL] Step 5: Sending DONE signal (0x{:02x})", CMD_DONE);
-    if let Err(e) = stream.write_all(&[CMD_DONE]) {
-        eprintln!("[TCP-DL] ERROR: Failed to send DONE: {}", e);
+    if let Err(e) = send_signal(stream, CMD_DONE) {
+        eprintln!("[TCP-DL] Failed to send DONE: {}", e);
         return false;
     }
-    if let Err(e) = stream.flush() {
-        eprintln!("[TCP-DL] ERROR: Failed to flush DONE: {}", e);
-        return false;
-    }
-
-    println!("[TCP-DL] Step 6: DONE signal sent");
     true
 }
 
+/// Upload test: ACK, read and discard client data for `TEST_DURATION`, then DONE.
+/// Returns `false` if the connection should be closed.
 fn handle_tcp_upload(stream: &mut TcpStream) -> bool {
-    println!("[TCP-UL] Step 1: Sending ACK (0x{:02x})", CMD_ACK);
-
-    if let Err(e) = stream.write_all(&[CMD_ACK]) {
-        eprintln!("[TCP-UL] ERROR: Failed to send ACK: {}", e);
+    if let Err(e) = send_signal(stream, CMD_ACK) {
+        eprintln!("[TCP-UL] Failed to send ACK: {}", e);
         return false;
     }
-    if let Err(e) = stream.flush() {
-        eprintln!("[TCP-UL] ERROR: Failed to flush ACK: {}", e);
-        return false;
-    }
-    println!("[TCP-UL] Step 2: ACK sent, ready to receive");
 
     let mut buffer = [0u8; BUFFER_SIZE];
     let start_time = Instant::now();
-    let mut bytes_received = 0u64;
-    let mut reads = 0u64;
 
+    // Short timeout so a stalled client doesn't keep us past the test window.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-
-    println!(
-        "[TCP-UL] Step 3: Receiving data for {} seconds",
-        TEST_DURATION.as_secs()
-    );
 
     while start_time.elapsed() < TEST_DURATION {
         match stream.read(&mut buffer) {
-            Ok(0) => {
-                println!("[TCP-UL] WARNING: Client closed connection early");
-                return false;
-            }
-            Ok(n) => {
-                bytes_received += n as u64;
-                reads += 1;
-            }
+            // Client closed the connection before the test finished.
+            Ok(0) => return false,
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut
-                {
-                    continue;
-                } else {
-                    eprintln!("[TCP-UL] ERROR: Read error: {}", e);
-                    return false;
-                }
+                eprintln!("[TCP-UL] Read error: {}", e);
+                return false;
             }
         }
     }
 
-    println!("[TCP-UL] Step 4: Reception complete");
-    println!("[TCP-UL]   - Received {} reads", reads);
-    println!(
-        "[TCP-UL]   - Received {} bytes ({:.2} MB)",
-        bytes_received,
-        bytes_received as f64 / 1_000_000.0
-    );
-
     thread::sleep(Duration::from_millis(10));
 
-    println!("[TCP-UL] Step 5: Sending DONE signal (0x{:02x})", CMD_DONE);
-    if let Err(e) = stream.write_all(&[CMD_DONE]) {
-        eprintln!("[TCP-UL] ERROR: Failed to send DONE: {}", e);
+    if let Err(e) = send_signal(stream, CMD_DONE) {
+        eprintln!("[TCP-UL] Failed to send DONE: {}", e);
         return false;
     }
-    if let Err(e) = stream.flush() {
-        eprintln!("[TCP-UL] ERROR: Failed to flush DONE: {}", e);
-        return false;
-    }
-
-    println!("[TCP-UL] Step 6: DONE signal sent");
     true
 }
 
@@ -265,93 +170,62 @@ fn handle_tcp_upload(stream: &mut TcpStream) -> bool {
 //              UDP HANDLING
 // ==========================================
 
+/// Receives UDP commands. Download requests are served on a separate thread;
+/// upload datagrams are simply discarded.
 fn start_udp_listener() {
     let socket = UdpSocket::bind(format!("0.0.0.0:{}", UDP_PORT)).expect("Failed to bind UDP port");
-    println!("[UDP] Listener started successfully");
 
     let mut buf = [0u8; 1024];
 
     loop {
-        match socket.recv_from(&mut buf) {
-            Ok((size, src_addr)) => {
-                if size > 0 {
-                    let command = buf[0];
-                    println!(
-                        "\n[UDP] Received command 0x{:02x} from {}",
-                        command, src_addr
-                    );
-
-                    match command {
-                        CMD_DOWNLOAD => {
-                            println!("[UDP] >>> Starting DOWNLOAD Test for {} <<<", src_addr);
-
-                            // Send ACK immediately
-                            println!("[UDP-DL] Step 1: Sending ACK (0x{:02x})", CMD_ACK);
-                            if let Err(e) = socket.send_to(&[CMD_ACK], src_addr) {
-                                eprintln!("[UDP-DL] ERROR: Failed to send ACK: {}", e);
-                                continue;
-                            }
-                            println!("[UDP-DL] Step 2: ACK sent");
-
-                            let socket_clone = socket.try_clone().expect("Failed to clone socket");
-                            thread::spawn(move || {
-                                handle_udp_download(socket_clone, src_addr);
-                            });
-                        }
-                        CMD_UPLOAD => {
-                            // This is the upload test - server just sinks the data
-                            // No response needed, just acknowledge receipt
-                        }
-                        _ => {
-                            eprintln!("[UDP] ERROR: Unknown command: 0x{:02x}", command);
-                        }
-                    }
-                }
+        let (size, src_addr) = match socket.recv_from(&mut buf) {
+            Ok(received) => received,
+            Err(e) => {
+                eprintln!("[UDP] Receive error: {}", e);
+                continue;
             }
-            Err(e) => eprintln!("[UDP] Receive error: {}", e),
+        };
+        // Commands are single-byte datagrams. Anything larger is upload payload,
+        // which the server just discards. (Payload bytes are 0x01, the same value
+        // as CMD_DOWNLOAD, so they must not be read as commands.)
+        if size != 1 {
+            continue;
+        }
+
+        match buf[0] {
+            CMD_DOWNLOAD => {
+                if let Err(e) = socket.send_to(&[CMD_ACK], src_addr) {
+                    eprintln!("[UDP-DL] Failed to send ACK: {}", e);
+                    continue;
+                }
+
+                // Stream on a cloned socket so this loop keeps receiving.
+                let socket_clone = socket.try_clone().expect("Failed to clone socket");
+                thread::spawn(move || handle_udp_download(socket_clone, src_addr));
+            }
+            // The upload trigger needs no reply; the client just starts sending.
+            CMD_UPLOAD => {}
+            cmd => eprintln!("[UDP] Unknown command 0x{:02x}", cmd),
         }
     }
 }
 
-fn handle_udp_download(socket: UdpSocket, addr: std::net::SocketAddr) {
-    println!("[UDP-DL] Step 3: Starting packet transmission");
-
+/// Sends datagrams to `addr` for `TEST_DURATION`, then a DONE signal.
+fn handle_udp_download(socket: UdpSocket, addr: SocketAddr) {
     let payload = [1u8; UDP_PAYLOAD_SIZE];
     let start_time = Instant::now();
-    let mut packet_count = 0u64;
-    let mut errors = 0u64;
 
     while start_time.elapsed() < TEST_DURATION {
-        match socket.send_to(&payload, addr) {
-            Ok(_) => packet_count += 1,
-            Err(e) => {
-                errors += 1;
-                if errors == 1 {
-                    eprintln!("[UDP-DL] ERROR: Send error: {}", e);
-                }
-                break;
-            }
+        if let Err(e) = socket.send_to(&payload, addr) {
+            eprintln!("[UDP-DL] Send error: {}", e);
+            break;
         }
 
-        // Small delay to prevent overwhelming the network
+        // Brief pause so we don't overrun the send buffer.
         thread::sleep(Duration::from_micros(10));
     }
 
-    println!("[UDP-DL] Step 4: Transmission complete");
-    println!("[UDP-DL]   - Sent {} packets", packet_count);
-    println!(
-        "[UDP-DL]   - Total bytes: {} ({:.2} MB)",
-        packet_count * UDP_PAYLOAD_SIZE as u64,
-        (packet_count * UDP_PAYLOAD_SIZE as u64) as f64 / 1_000_000.0
-    );
-
-    // Send completion signal
-    println!("[UDP-DL] Step 5: Sending DONE signal (0x{:02x})", CMD_DONE);
     if let Err(e) = socket.send_to(&[CMD_DONE], addr) {
-        eprintln!("[UDP-DL] ERROR: Failed to send DONE signal: {}", e);
-    } else {
-        println!("[UDP-DL] Step 6: DONE signal sent");
+        eprintln!("[UDP-DL] Failed to send DONE signal: {}", e);
     }
-
-    println!("[UDP] >>> DOWNLOAD Test Complete for {} <<<\n", addr);
 }
